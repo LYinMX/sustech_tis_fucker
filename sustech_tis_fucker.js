@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sustech_tis_fucker
 // @namespace    https://github.com/LYinMX/sustech_tis_fucker
-// @version      26.9.8
+// @version      26.9.9
 // @description  sustech tis 增强功能插件
 // @match        https://tis.sustech.edu.cn/*
 // @icon         https://www.sustech.edu.cn/static/images/favicon.ico
@@ -12,25 +12,43 @@
 (function ($) {
     'use strict';
 
-    let cachedEnrollments = [];
+    let courseDataMap = {}; // 存储所有课程数据，键为课程名，值为 { bks, yjs, male, female }
     let observer = null;
 
-    function parseEnrollments(resp) {
+    // ---------- 解析并合并数据 ----------
+    function mergeEnrollments(resp) {
+        let allItems = [];
+
+        // 1. 解析可选课程列表 (kxrwList)
         let list = resp.kxrwList || resp.list || resp.data;
         if (!Array.isArray(list) && list && typeof list === 'object' && Array.isArray(list.list)) {
             list = list.list;
         }
-        if (!Array.isArray(list)) list = [];
-        return list.map(item => ({
-            kcmc: item.kcmc || item.kc_mc || item.courseName || '未知课程',
-            yxzrs: item.bksyxrs || item.yxrs || item.selectedCount || '?',
-            nansyxrs: item.nansyxrs || '?',
-            nvsyxrs: item.nvsyxrs || '?',
-            kcdm: item.kcdm || item.kc_dm || '',
-            rwmc: item.rwmc || ''
-        }));
+        if (Array.isArray(list)) {
+            allItems = allItems.concat(list);
+        }
+
+        // 2. 解析已选课程列表 (yxkcList)
+        if (Array.isArray(resp.yxkcList)) {
+            allItems = allItems.concat(resp.yxkcList);
+        }
+
+        // 3. 存入 map，以课程名为键（覆盖已存在的）
+        allItems.forEach(item => {
+            const name = item.kcmc || item.kc_mc || item.courseName;
+            if (!name) return;
+            courseDataMap[name] = {
+                bks: item.bksyxrs || item.bksyxzrs || '?',
+                yjs: item.yjsyxrs || item.yjsyxzrs || '?',
+                male: item.nansyxrs || '?',
+                female: item.nvsyxrs || '?'
+            };
+        });
+
+        console.log('[真实人数] 已合并数据，共', Object.keys(courseDataMap).length, '门课程');
     }
 
+    // ---------- 劫持 XHR ----------
     const origXHROpen = XMLHttpRequest.prototype.open;
     const origXHRSend = XMLHttpRequest.prototype.send;
 
@@ -41,30 +59,24 @@
     };
 
     XMLHttpRequest.prototype.send = function (body) {
-        if (this._url && (this._url.includes('Xsxk/query') || this._url.includes('Xsxk/cxqhquery'))) {
+        if (this._url && this._url.includes('Xsxk/query')) {
             this.addEventListener('readystatechange', function () {
                 if (this.readyState === 4 && this.status === 200) {
                     try {
                         const resp = JSON.parse(this.responseText);
-                        const parsed = parseEnrollments(resp);
-                        if (parsed.length > 0) {
-                            cachedEnrollments = parsed;
-                            console.log('[真实人数] XHR 捕获到数据:', cachedEnrollments.length);
-                            updatePageRealEnroll();
-                            startObserver();
-                        }
-                    } catch (e) { console.warn('[真实人数] 解析 XHR 失败', e); }
+                        mergeEnrollments(resp);
+                        updatePageRealEnroll();
+                        startObserver();
+                    } catch (e) { console.warn('[真实人数] 解析失败', e); }
                 }
             });
         }
         return origXHRSend.apply(this, arguments);
     };
 
+    // ---------- 在页面上显示信息（已选和可选都适用） ----------
     function updatePageRealEnroll() {
-        if (!cachedEnrollments || cachedEnrollments.length === 0) {
-            console.warn('[真实人数] 缓存为空，无法更新');
-            return;
-        }
+        if (Object.keys(courseDataMap).length === 0) return;
 
         const docs = [document];
         document.querySelectorAll('iframe').forEach(iframe => {
@@ -77,12 +89,13 @@
         let totalInserted = 0;
 
         docs.forEach(doc => {
-            cachedEnrollments.forEach(item => {
-                const courseName = item.kcmc;
-                const realNum = item.yxzrs;
-                const male = item.nansyxrs;
-                const female = item.nvsyxrs;
-                if (!courseName || realNum === '?') return;
+            Object.keys(courseDataMap).forEach(courseName => {
+                const data = courseDataMap[courseName];
+                const bks = data.bks;
+                const yjs = data.yjs;
+                const male = data.male;
+                const female = data.female;
+                if (!courseName || bks === '?') return;
 
                 // 查找包含课程名的表格行（tr）
                 const xpath = `.//tr[descendant::*[contains(text(), '${courseName}')]]`;
@@ -91,7 +104,7 @@
                 while (row = result.iterateNext()) {
                     if (row.querySelector('.tis-real-enroll')) continue;
 
-                    // 查找“已选人数”文本所在的元素
+                    // 查找“已选人数”文本所在的元素（兼容“已选人数：”格式）
                     const numXpath = `.//*[contains(text(), '已选人数')]`;
                     const numResult = doc.evaluate(numXpath, row, null, XPathResult.ANY_TYPE, null);
                     let numNode = numResult.iterateNext();
@@ -102,21 +115,15 @@
                             const span = doc.createElement('span');
                             span.className = 'tis-real-enroll';
                             span.style.cssText = 'margin-left: 12px; color: #ff6b00; font-weight: bold; background: #fff3e0; padding: 2px 8px; border-radius: 4px; font-size: 13px; white-space: nowrap; display: inline-block;';
-                            span.textContent = `人数: ${realNum} | 男: ${male} | 女: ${female}`;
+                            span.textContent = `本: ${bks} | 研: ${yjs} | 男: ${male} | 女: ${female}`;
                             td.appendChild(span);
                             totalInserted++;
-                            console.log(`[真实人数] 插入成功：“${courseName}” → 总${realNum} 男${male} 女${female}`);
                             break;
                         }
                     }
                 }
             });
         });
-
-        console.log(`[真实人数] 共插入 ${totalInserted} 个标签`);
-        if (totalInserted === 0) {
-            console.warn('[真实人数] 未插入任何标签，可能页面结构变化');
-        }
     }
 
     // ---------- MutationObserver ----------
@@ -138,13 +145,12 @@
             attributes: false,
             characterData: false
         });
-        console.log('[真实人数] MutationObserver 已启动');
     }
 
     // ---------- 页面加载后启动 ----------
     $(document).ready(function () {
         setTimeout(() => {
-            if (cachedEnrollments.length > 0) {
+            if (Object.keys(courseDataMap).length > 0) {
                 updatePageRealEnroll();
             }
             startObserver();
